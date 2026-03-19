@@ -29,7 +29,7 @@ export default defineConfig({
     server: {
         host: true,
         port: 5173,
-        allowedHosts: ['manadork.app','manadork.gaming4.us']
+        allowedHosts: ['dev.manadork.app']
     },
     preview: {
         host: true,
