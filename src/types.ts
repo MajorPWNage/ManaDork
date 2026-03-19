@@ -91,4 +91,59 @@ export interface RoomSnapshot {
   }>;
   createdAt: string;
   updatedAt: string;
+
+  hostClientId?: string;
+  revision: number;
+  checksum: string;
+  lastHeartbeatAt?: string;
 }
+
+export type SyncIntent =
+  | { kind: 'life'; seatId: string; amount: number }
+  | { kind: 'poison'; seatId: string; amount: number }
+  | { kind: 'commander_tax'; seatId: string; commanderIndex: number; amount: number }
+  | { kind: 'commander_damage'; targetSeatId: string; sourceCommanderKey: string; amount: number }
+  | { kind: 'rename_player'; seatId: string; playerName: string }
+  | { kind: 'set_turn'; seatIndex: number }
+  | { kind: 'reset_game' }
+  | { kind: 'new_game_with_settings'; settings: Partial<RoomSettings> }
+  | { kind: 'revert_log_action'; actionId: string };
+
+export interface SyncIntentEnvelope {
+  id: string;
+  clientId: string;
+  actorName: string;
+  sentAt: string;
+  intent: SyncIntent;
+}
+
+export type SyncBroadcastPayload =
+  | {
+      type: 'host-heartbeat';
+      roomCode: string;
+      hostClientId: string;
+      revision: number;
+      checksum: string;
+      sentAt: string;
+    }
+  | {
+      type: 'state-changed';
+      roomCode: string;
+      hostClientId: string;
+      revision: number;
+      checksum: string;
+      sentAt: string;
+    }
+  | {
+      type: 'intent';
+      roomCode: string;
+      payload: SyncIntentEnvelope;
+    }
+  | {
+      type: 'host-elected';
+      roomCode: string;
+      hostClientId: string;
+      revision: number;
+      checksum: string;
+      sentAt: string;
+    };

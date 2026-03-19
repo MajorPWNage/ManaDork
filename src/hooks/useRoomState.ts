@@ -1,99 +1,69 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createMockRoom } from '../data/mockRoom';
 import { newId } from '../lib/id';
-import { hasSupabase, supabase } from '../lib/supabase';
+import { applyIntentToRoom } from '../lib/roomMutations';
 import { buildRoomSettings } from '../lib/roomSettings';
-import { normalizeRoomSnapshot } from '../lib/normalizeRoom';
+import { hasSupabase, supabase } from '../lib/supabase';
+import {
+  HEARTBEAT_MS,
+  RESYNC_MS,
+  bumpRoomRevision,
+  electNextHost,
+  isHostHeartbeatStale,
+  refreshRoomChecksum
+} from '../lib/sync';
 import {
   clearActiveRoom,
-  clearRoomRole,
   clearSeatAssignment,
   loadActiveRoom,
   loadOrCreateClientId,
   loadRecentRooms,
-  loadRoomRole,
   loadSeatAssignment,
   saveActiveRoom,
-  saveRoomRole,
   saveSeatAssignment
 } from '../lib/roomStorage';
 import type {
-  ClientRoomRole,
-  GameAction,
-  GameActionUndo,
-  PlayerSeat,
+  ConnectedClient,
   RoomSettings,
   RoomSnapshot,
+  SyncBroadcastPayload,
+  SyncIntent,
+  SyncIntentEnvelope,
   SyncMode
 } from '../types';
 
 const ROOM_TABLE = 'rooms';
-const seatColors = ['#a855f7', '#38bdf8', '#f59e0b', '#ef4444', '#22c55e', '#ec4899', '#eab308', '#6366f1'];
-
-type PresenceEntry = {
-  name: string;
-  seatId?: string;
-  joinedAt?: string;
-};
-
-function stampAction(
-  actor: string,
-  description: string,
-  options?: {
-    reversible?: boolean;
-    undo?: GameActionUndo;
-  }
-): GameAction {
-  return {
-    id: newId(),
-    actor,
-    description,
-    createdAt: new Date().toISOString(),
-    reversible: options?.reversible ?? false,
-    undo: options?.undo
-  };
-}
-
-function clonePlayers(players: PlayerSeat[]) {
-  return players.map((player) => ({
-    ...player,
-    commanderNames: [...player.commanderNames],
-    commanderTax: [...player.commanderTax],
-    commanderDamageTaken: { ...player.commanderDamageTaken }
-  }));
-}
-
-function pushUndo(room: RoomSnapshot): RoomSnapshot['undoStack'][number] {
-  return {
-    players: clonePlayers(room.players),
-    actionLog: [...room.actionLog],
-    turnSeatIndex: room.turnSeatIndex
-  };
-}
-
-function withChange(
-  room: RoomSnapshot,
-  actor: string,
-  description: string,
-  mutate: (draftPlayers: PlayerSeat[]) => PlayerSeat[],
-  options?: {
-    reversible?: boolean;
-    undo?: GameActionUndo;
-  }
-): RoomSnapshot {
-  const players = mutate(clonePlayers(room.players));
-
-  return {
-    ...room,
-    players,
-    actionLog: [stampAction(actor, description, options), ...room.actionLog].slice(0, 40),
-    undoStack: [pushUndo(room), ...room.undoStack].slice(0, 12),
-    updatedAt: new Date().toISOString()
-  };
-}
 
 function normalizeRoomCode(roomCode: string) {
   return roomCode.trim().toUpperCase();
+}
+
+function normalizeRoomSnapshot(snapshot: RoomSnapshot | null): RoomSnapshot | null {
+  if (!snapshot) {
+    return null;
+  }
+
+  const settings =
+    snapshot.settings ??
+    buildRoomSettings({
+      format: snapshot.format ?? 'commander',
+      playerCount: snapshot.players?.length ?? 4,
+      startingLife: snapshot.startingLife ?? 40
+    });
+
+  const normalized: RoomSnapshot = {
+    ...snapshot,
+    format: snapshot.format ?? settings.format,
+    startingLife: snapshot.startingLife ?? settings.startingLife,
+    settings,
+    hostClientId: snapshot.hostClientId,
+    revision: snapshot.revision ?? 1,
+    checksum: snapshot.checksum ?? '',
+    lastHeartbeatAt:
+      snapshot.lastHeartbeatAt ?? snapshot.updatedAt ?? snapshot.createdAt ?? new Date().toISOString()
+  };
+
+  return normalized.checksum ? normalized : refreshRoomChecksum(normalized);
 }
 
 async function persistRoom(room: RoomSnapshot) {
@@ -120,79 +90,483 @@ async function persistRoom(room: RoomSnapshot) {
 }
 
 export function useRoomState() {
-  const [room, setRoom] = useState<RoomSnapshot | null>(() => loadActiveRoom());
+  const [room, setRoom] = useState<RoomSnapshot | null>(() =>
+    normalizeRoomSnapshot(loadActiveRoom())
+  );
   const [joinCode, setJoinCode] = useState('');
   const [recentRooms, setRecentRooms] = useState<string[]>(() => loadRecentRooms());
   const [status, setStatus] = useState<string>('Ready');
-  const [connectedClients, setConnectedClients] = useState<Record<string, PresenceEntry>>({});
-  const [clientRoomRole, setClientRoomRole] = useState<ClientRoomRole>(() => {
-  const active = loadActiveRoom();
-    if (!active || active.syncMode !== 'online') {
-      return 'player';
-    }
-
-    return loadRoomRole(active.roomCode) ?? 'player';
-  });
+  const [connectedClients, setConnectedClients] = useState<Record<string, ConnectedClient>>({});
   const [focusedSeatId, setFocusedSeatId] = useState<string | null>(() => {
-    const active = loadActiveRoom();
+    const active = normalizeRoomSnapshot(loadActiveRoom());
     if (!active || active.syncMode !== 'online') {
       return null;
     }
 
-    const clientId = loadOrCreateClientId();
-    const controlledSeat = active.players.find((player) => player.controllerClientId === clientId);
+    const localClientId = loadOrCreateClientId();
+    const controlledSeat = active.players.find(
+      (player) => player.controllerClientId === localClientId
+    );
+
     return controlledSeat?.id ?? loadSeatAssignment(active.roomCode);
   });
 
   const clientId = useRef(loadOrCreateClientId());
-  const presenceChannelRef = useRef<any>(null);
   const roomSubRef = useRef<any>(null);
+  const presenceChannelRef = useRef<any>(null);
+  const syncChannelRef = useRef<any>(null);
+  const roomRef = useRef<RoomSnapshot | null>(room);
+  const heartbeatTimerRef = useRef<number | null>(null);
+  const resyncTimerRef = useRef<number | null>(null);
+  const lastHostHeartbeatRef = useRef<string | null>(null);
+  const processedIntentIdsRef = useRef<Set<string>>(new Set());
 
   const isOnline = room?.syncMode === 'online';
 
-  const hydrateRoom = useCallback((nextRoom: RoomSnapshot) => {
-    const normalizedRoom = normalizeRoomSnapshot(nextRoom);
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
 
-    setRoom(normalizedRoom);
-    saveActiveRoom(normalizedRoom);
+  const hydrateRoom = useCallback((nextRoomInput: RoomSnapshot) => {
+    const nextRoom = normalizeRoomSnapshot(nextRoomInput);
+    if (!nextRoom) {
+      return;
+    }
+
+    roomRef.current = nextRoom;
+    setRoom(nextRoom);
+    saveActiveRoom(nextRoom);
     setRecentRooms(loadRecentRooms());
 
-    if (normalizedRoom.syncMode === 'online') {
-      const localRole = loadRoomRole(normalizedRoom.roomCode) ?? clientRoomRole;
-      setClientRoomRole(localRole);
+    if (nextRoom.syncMode === 'online') {
+      const controlledSeat = nextRoom.players.find(
+        (player) => player.controllerClientId === clientId.current
+      );
+      const nextSeatId = controlledSeat?.id ?? loadSeatAssignment(nextRoom.roomCode);
+      setFocusedSeatId(nextSeatId ?? null);
 
-      if (localRole === 'host') {
-        setFocusedSeatId(null);
-      } else {
-        const controlledSeat = normalizedRoom.players.find(
-          (player) => player.controllerClientId === clientId.current
-        );
-        const nextSeatId = controlledSeat?.id ?? loadSeatAssignment(normalizedRoom.roomCode);
-        setFocusedSeatId(nextSeatId ?? null);
-
-        if (nextSeatId) {
-          saveSeatAssignment(normalizedRoom.roomCode, nextSeatId);
-        }
+      if (nextSeatId) {
+        saveSeatAssignment(nextRoom.roomCode, nextSeatId);
       }
     } else {
       setFocusedSeatId(null);
-      setClientRoomRole('player');
     }
   }, []);
 
+  const updateRoom = useCallback(async (updater: (current: RoomSnapshot) => RoomSnapshot) => {
+    setRoom((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const next = normalizeRoomSnapshot(updater(current));
+      if (!next) {
+        return current;
+      }
+
+      roomRef.current = next;
+      saveActiveRoom(next);
+      void persistRoom(next);
+      return next;
+    });
+
+    setRecentRooms(loadRecentRooms());
+  }, []);
+
+  const fetchRoomFromServer = useCallback(async (roomCode: string) => {
+    if (!supabase) {
+      return null;
+    }
+
+    const { data, error } = await supabase
+      .from(ROOM_TABLE)
+      .select('game_state')
+      .eq('room_code', roomCode)
+      .single();
+
+    if (error || !data?.game_state) {
+      return null;
+    }
+
+    return normalizeRoomSnapshot(data.game_state as RoomSnapshot);
+  }, []);
+
+  const isCurrentClientHost = useCallback((snapshot?: RoomSnapshot | null) => {
+    const target = snapshot ?? roomRef.current;
+    return Boolean(
+      target && target.syncMode === 'online' && target.hostClientId === clientId.current
+    );
+  }, []);
+
+  const forceResyncCheck = useCallback(async () => {
+    const current = roomRef.current;
+    if (!current || current.syncMode !== 'online') {
+      return;
+    }
+
+    const serverRoom = await fetchRoomFromServer(current.roomCode);
+    if (!serverRoom) {
+      return;
+    }
+
+    const mismatch =
+      current.revision !== serverRoom.revision ||
+      current.checksum !== serverRoom.checksum ||
+      current.hostClientId !== serverRoom.hostClientId;
+
+    if (mismatch) {
+      hydrateRoom(serverRoom);
+      setStatus('Resynced with host');
+    }
+  }, [fetchRoomFromServer, hydrateRoom]);
+
+  const sendHostHeartbeat = useCallback(async () => {
+    const current = roomRef.current;
+    if (!current || !isCurrentClientHost(current) || !syncChannelRef.current) {
+      return;
+    }
+
+    const sentAt = new Date().toISOString();
+    lastHostHeartbeatRef.current = sentAt;
+
+    const payload: SyncBroadcastPayload = {
+      type: 'host-heartbeat',
+      roomCode: current.roomCode,
+      hostClientId: clientId.current,
+      revision: current.revision,
+      checksum: current.checksum,
+      sentAt
+    };
+
+    await syncChannelRef.current.send({
+      type: 'broadcast',
+      event: 'host-heartbeat',
+      payload
+    });
+  }, [isCurrentClientHost]);
+
+  const stopHeartbeatTimer = useCallback(() => {
+    if (heartbeatTimerRef.current) {
+      window.clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+  }, []);
+
+  const stopResyncTimer = useCallback(() => {
+    if (resyncTimerRef.current) {
+      window.clearInterval(resyncTimerRef.current);
+      resyncTimerRef.current = null;
+    }
+  }, []);
+
+  const applyIntentAsHost = useCallback(
+    async (envelope: SyncIntentEnvelope) => {
+      const current = roomRef.current;
+      if (!current || current.syncMode !== 'online' || !isCurrentClientHost(current)) {
+        return;
+      }
+
+      const mutated = applyIntentToRoom(current, envelope);
+
+      const next = normalizeRoomSnapshot(
+        bumpRoomRevision({
+          ...mutated,
+          hostClientId: clientId.current,
+          lastHeartbeatAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        })
+      );
+
+      if (!next) {
+        return;
+      }
+
+      hydrateRoom(next);
+      await persistRoom(next);
+
+      if (syncChannelRef.current) {
+        const payload: SyncBroadcastPayload = {
+          type: 'state-changed',
+          roomCode: next.roomCode,
+          hostClientId: clientId.current,
+          revision: next.revision,
+          checksum: next.checksum,
+          sentAt: new Date().toISOString()
+        };
+
+        await syncChannelRef.current.send({
+          type: 'broadcast',
+          event: 'state-changed',
+          payload
+        });
+      }
+    },
+    [hydrateRoom, isCurrentClientHost]
+  );
+
+  const maybeElectHost = useCallback(
+    async (clients: Record<string, ConnectedClient>) => {
+      const current = roomRef.current;
+      if (!current || current.syncMode !== 'online') {
+        return;
+      }
+
+      const latestHeartbeatAt = lastHostHeartbeatRef.current ?? current.lastHeartbeatAt;
+      const hostPresent = current.hostClientId ? Boolean(clients[current.hostClientId]) : false;
+      const hostStale = isHostHeartbeatStale(latestHeartbeatAt);
+
+      if (hostPresent && !hostStale) {
+        return;
+      }
+
+      const electedClientId = electNextHost(clients);
+      if (!electedClientId || electedClientId !== clientId.current) {
+        return;
+      }
+
+      const electedRoom = normalizeRoomSnapshot(
+        bumpRoomRevision({
+          ...current,
+          hostClientId: clientId.current,
+          lastHeartbeatAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        })
+      );
+
+      if (!electedRoom) {
+        return;
+      }
+
+      hydrateRoom(electedRoom);
+      await persistRoom(electedRoom);
+
+      if (syncChannelRef.current) {
+        const payload: SyncBroadcastPayload = {
+          type: 'host-elected',
+          roomCode: electedRoom.roomCode,
+          hostClientId: clientId.current,
+          revision: electedRoom.revision,
+          checksum: electedRoom.checksum,
+          sentAt: new Date().toISOString()
+        };
+
+        await syncChannelRef.current.send({
+          type: 'broadcast',
+          event: 'host-elected',
+          payload
+        });
+      }
+
+      setStatus('You are now the host');
+    },
+    [hydrateRoom]
+  );
+
+  const handleHostHeartbeat = useCallback(
+    async (payload: any) => {
+      const current = roomRef.current;
+      if (!current || current.syncMode !== 'online') {
+        return;
+      }
+
+      lastHostHeartbeatRef.current = payload?.sentAt ?? new Date().toISOString();
+
+      const mismatch =
+        current.revision !== payload?.revision ||
+        current.checksum !== payload?.checksum ||
+        current.hostClientId !== payload?.hostClientId;
+
+      if (mismatch) {
+        await forceResyncCheck();
+      }
+    },
+    [forceResyncCheck]
+  );
+
+  const handleStateChanged = useCallback(
+    async (payload: any) => {
+      const current = roomRef.current;
+      if (!current || current.syncMode !== 'online') {
+        return;
+      }
+
+      const mismatch =
+        current.revision !== payload?.revision ||
+        current.checksum !== payload?.checksum ||
+        current.hostClientId !== payload?.hostClientId;
+
+      if (mismatch) {
+        await forceResyncCheck();
+      }
+    },
+    [forceResyncCheck]
+  );
+
+  const handleHostElected = useCallback(
+    async (payload: any) => {
+      const current = roomRef.current;
+      if (!current || current.syncMode !== 'online') {
+        return;
+      }
+
+      const next = normalizeRoomSnapshot({
+        ...current,
+        hostClientId: payload?.hostClientId,
+        lastHeartbeatAt: payload?.sentAt ?? new Date().toISOString(),
+        revision: payload?.revision ?? current.revision,
+        checksum: payload?.checksum ?? current.checksum
+      });
+
+      if (next) {
+        hydrateRoom(next);
+      }
+
+      await forceResyncCheck();
+    },
+    [forceResyncCheck, hydrateRoom]
+  );
+
+  const handleIntent = useCallback(
+    async (broadcast: any) => {
+      const current = roomRef.current;
+      if (!current || current.syncMode !== 'online') {
+        return;
+      }
+
+      const envelope = broadcast?.payload as SyncIntentEnvelope | undefined;
+      if (!envelope) {
+        return;
+      }
+
+      if (!isCurrentClientHost(current)) {
+        return;
+      }
+
+      if (processedIntentIdsRef.current.has(envelope.id)) {
+        return;
+      }
+
+      processedIntentIdsRef.current.add(envelope.id);
+
+      if (processedIntentIdsRef.current.size > 200) {
+        const trimmed = Array.from(processedIntentIdsRef.current).slice(-100);
+        processedIntentIdsRef.current = new Set(trimmed);
+      }
+
+      await applyIntentAsHost(envelope);
+    },
+    [applyIntentAsHost, isCurrentClientHost]
+  );
+
+  const subscribeToRoom = useCallback(
+    async (roomCode: string, displayName = 'Guest') => {
+      if (!supabase) {
+        return;
+      }
+
+      roomSubRef.current?.unsubscribe?.();
+      presenceChannelRef.current?.unsubscribe?.();
+      syncChannelRef.current?.unsubscribe?.();
+
+      roomSubRef.current = supabase
+        .channel(`room-row:${roomCode}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: ROOM_TABLE,
+            filter: `room_code=eq.${roomCode}`
+          },
+          (payload: any) => {
+            const nextRoom = normalizeRoomSnapshot(payload.new?.game_state as RoomSnapshot);
+            if (nextRoom) {
+              hydrateRoom(nextRoom);
+            }
+          }
+        )
+        .subscribe();
+
+      const presenceChannel = supabase.channel(`room-presence:${roomCode}`, {
+        config: {
+          presence: {
+            key: clientId.current
+          }
+        }
+      });
+
+      presenceChannel
+        .on('presence', { event: 'sync' }, () => {
+          const state = presenceChannel.presenceState() as Record<string, ConnectedClient[]>;
+          const next: Record<string, ConnectedClient> = {};
+
+          Object.entries(state).forEach(([key, value]) => {
+            const first = value[0];
+            if (first) {
+              next[key] = {
+                clientId: key,
+                name: first.name ?? 'Guest',
+                seatId: first.seatId,
+                joinedAt: first.joinedAt ?? new Date().toISOString()
+              };
+            }
+          });
+
+          setConnectedClients(next);
+          void maybeElectHost(next);
+        })
+        .subscribe(async (subscribeStatus: string) => {
+          if (subscribeStatus === 'SUBSCRIBED') {
+            await presenceChannel.track({
+              clientId: clientId.current,
+              name: displayName,
+              seatId: focusedSeatId ?? undefined,
+              joinedAt: new Date().toISOString()
+            });
+          }
+        });
+
+      presenceChannelRef.current = presenceChannel;
+
+      const syncChannel = supabase
+        .channel(`room-sync:${roomCode}`)
+        .on('broadcast', { event: 'host-heartbeat' }, ({ payload }: any) => {
+          void handleHostHeartbeat(payload);
+        })
+        .on('broadcast', { event: 'state-changed' }, ({ payload }: any) => {
+          void handleStateChanged(payload);
+        })
+        .on('broadcast', { event: 'intent' }, ({ payload }: any) => {
+          void handleIntent(payload);
+        })
+        .on('broadcast', { event: 'host-elected' }, ({ payload }: any) => {
+          void handleHostElected(payload);
+        })
+        .subscribe();
+
+      syncChannelRef.current = syncChannel;
+    },
+    [
+      focusedSeatId,
+      handleHostHeartbeat,
+      handleHostElected,
+      handleIntent,
+      handleStateChanged,
+      hydrateRoom,
+      maybeElectHost
+    ]
+  );
+
   const claimSeat = useCallback(
-    async (nextRoom: RoomSnapshot, preferredSeatId?: string) => {
-      if (nextRoom.syncMode !== 'online') {
-        return null;
-      }
-      const localRole = loadRoomRole(nextRoom.roomCode) ?? clientRoomRole;
-
-      if (localRole === 'host') {
-        setFocusedSeatId(null);
+    async (nextRoomInput: RoomSnapshot, preferredSeatId?: string) => {
+      const nextRoom = normalizeRoomSnapshot(nextRoomInput);
+      if (!nextRoom || nextRoom.syncMode !== 'online') {
         return null;
       }
 
-      const alreadyControlled = nextRoom.players.find((player) => player.controllerClientId === clientId.current);
+      const alreadyControlled = nextRoom.players.find(
+        (player) => player.controllerClientId === clientId.current
+      );
       if (alreadyControlled) {
         saveSeatAssignment(nextRoom.roomCode, alreadyControlled.id);
         setFocusedSeatId(alreadyControlled.id);
@@ -211,26 +585,30 @@ export function useRoomState() {
         : null;
 
       const openSeat =
-        requestedSeat ??
-        nextRoom.players.find((player) => !player.controllerClientId) ??
-        nextRoom.players[0];
+        requestedSeat ?? nextRoom.players.find((player) => !player.controllerClientId) ?? null;
 
       if (!openSeat) {
         return null;
       }
 
-      const claimedRoom: RoomSnapshot = {
-        ...nextRoom,
-        players: nextRoom.players.map((player) =>
-          player.id === openSeat.id
-            ? {
-                ...player,
-                controllerClientId: clientId.current
-              }
-            : player
-        ),
-        updatedAt: new Date().toISOString()
-      };
+      const claimedRoom = normalizeRoomSnapshot(
+        bumpRoomRevision({
+          ...nextRoom,
+          players: nextRoom.players.map((player) =>
+            player.id === openSeat.id
+              ? {
+                  ...player,
+                  controllerClientId: clientId.current
+                }
+              : player
+          ),
+          updatedAt: new Date().toISOString()
+        })
+      );
+
+      if (!claimedRoom) {
+        return null;
+      }
 
       hydrateRoom(claimedRoom);
       saveSeatAssignment(claimedRoom.roomCode, openSeat.id);
@@ -240,578 +618,266 @@ export function useRoomState() {
     [hydrateRoom]
   );
 
-  const subscribeToRoom = useCallback(
-    async (roomCode: string, displayName = 'Guest') => {
-      if (!supabase) {
+  const createRoom = useCallback(
+    async (mode: SyncMode, settingsInput: Partial<RoomSettings> = {}) => {
+      const baseRoom = createMockRoom(settingsInput);
+
+      const nextRoom = normalizeRoomSnapshot(
+        refreshRoomChecksum({
+          ...baseRoom,
+          syncMode: mode,
+          hostClientId: mode === 'online' ? clientId.current : undefined,
+          lastHeartbeatAt: new Date().toISOString(),
+          actionLog: mode === 'online' ? [] : baseRoom.actionLog
+        })
+      );
+
+      if (!nextRoom) {
         return;
       }
 
-      roomSubRef.current?.unsubscribe?.();
-      presenceChannelRef.current?.unsubscribe?.();
+      hydrateRoom(nextRoom);
+      setStatus(mode === 'online' ? 'Creating synced room…' : 'Created local room');
 
-      roomSubRef.current = supabase
-        .channel(`room-row:${roomCode}`)
-        .on(
-          'postgres_changes',
-          {
-            event: 'UPDATE',
-            schema: 'public',
-            table: ROOM_TABLE,
-            filter: `room_code=eq.${roomCode}`
-          },
-          (payload: any) => {
-            const nextRoom = payload.new?.game_state;
-              if (nextRoom) {
-                hydrateRoom(normalizeRoomSnapshot(nextRoom));
-              }
-          }
-        )
-        .subscribe();
-
-      const presenceChannel = supabase.channel(`room-presence:${roomCode}`, {
-        config: {
-          presence: {
-            key: clientId.current
-          }
-        }
-      });
-
-      presenceChannel
-        .on('presence', { event: 'sync' }, () => {
-          const state = presenceChannel.presenceState() as Record<string, PresenceEntry[]>;
-          const next: Record<string, PresenceEntry> = {};
-
-          Object.entries(state).forEach(([key, value]) => {
-            const first = value[0];
-            if (first) {
-              next[key] = first;
-            }
-          });
-
-          setConnectedClients(next);
-        })
-        .subscribe(async (subscribeStatus: string) => {
-          if (subscribeStatus === 'SUBSCRIBED') {
-            await presenceChannel.track({
-              name: displayName,
-              seatId: focusedSeatId ?? undefined,
-              role: loadRoomRole(roomCode) ?? clientRoomRole,
-              joinedAt: new Date().toISOString()
-            });
-          }
+      if (mode === 'online' && supabase) {
+        const { error } = await supabase.from(ROOM_TABLE).insert({
+          room_code: nextRoom.roomCode,
+          room_name: nextRoom.roomName,
+          format: nextRoom.format,
+          starting_life: nextRoom.startingLife,
+          game_state: nextRoom
         });
 
-      presenceChannelRef.current = presenceChannel;
-    },
-    [focusedSeatId, hydrateRoom]
-  );
+        if (error) {
+          console.error(error);
+          setStatus('Supabase insert failed, using local mode instead');
 
-  const createRoom = useCallback(
-  async (
-    mode: SyncMode,
-    settingsInput: Partial<RoomSettings> = {},
-    role: ClientRoomRole = 'player'
-  ) => {
-    const baseRoom = createMockRoom(settingsInput);
+          const fallback = normalizeRoomSnapshot({
+            ...nextRoom,
+            syncMode: 'local',
+            hostClientId: undefined
+          });
 
-    const nextRoom: RoomSnapshot = {
-      ...baseRoom,
-      syncMode: mode,
-      actionLog: [stampAction('System', `${mode === 'online' ? 'Online' : 'Local'} room created`)]
-    };
+          if (fallback) {
+            hydrateRoom(fallback);
+          }
+          return;
+        }
 
-    hydrateRoom(nextRoom);
-    if (mode === 'online') {
-      saveRoomRole(nextRoom.roomCode, role);
-      setClientRoomRole(role);
-    }
-    setStatus(mode === 'online' ? 'Creating synced room…' : 'Created local room');
-
-    if (mode === 'online' && supabase) {
-      const { error } = await supabase.from(ROOM_TABLE).insert({
-        room_code: nextRoom.roomCode,
-        room_name: nextRoom.roomName,
-        format: nextRoom.format,
-        starting_life: nextRoom.startingLife,
-        game_state: nextRoom
-      });
-
-      if (error) {
-        console.error(error);
-        setStatus('Supabase insert failed, using local mode instead');
-
-        const fallback: RoomSnapshot = {
-          ...nextRoom,
-          syncMode: 'local'
-        };
-
-        hydrateRoom(fallback);
-        return;
-      }
-
-      await subscribeToRoom(nextRoom.roomCode, 'Host');
-      if (role !== 'host') {
+        await subscribeToRoom(nextRoom.roomCode, 'Host');
         await claimSeat(nextRoom, nextRoom.players[0]?.id);
+        setStatus('Synced room ready');
       }
-      setStatus('Synced room ready');
-    }
-  },
-  [claimSeat, hydrateRoom, subscribeToRoom]
-);
+    },
+    [claimSeat, hydrateRoom, subscribeToRoom]
+  );
 
   const joinRoom = useCallback(
     async (roomCode: string) => {
-      const normalized = normalizeRoomCode(roomCode);
-      setJoinCode(normalized);
-      saveRoomRole(normalized, 'player');
-      setClientRoomRole('player');
+      const normalizedCode = normalizeRoomCode(roomCode);
+      setJoinCode(normalizedCode);
 
       if (!supabase) {
         setStatus('Supabase is not configured. Join works after env vars are added.');
         return;
       }
 
-      setStatus(`Joining ${normalized}…`);
+      setStatus(`Joining ${normalizedCode}…`);
 
-      const { data, error } = await supabase
-        .from(ROOM_TABLE)
-        .select('game_state')
-        .eq('room_code', normalized)
-        .single();
+      const serverRoom = await fetchRoomFromServer(normalizedCode);
 
-      if (error || !data?.game_state) {
+      if (!serverRoom) {
         setStatus('Room not found');
         return;
       }
 
-      const nextRoom = normalizeRoomSnapshot(data.game_state);
-      hydrateRoom(nextRoom);
-      await subscribeToRoom(normalized, 'Guest');
-      await claimSeat(nextRoom);
+      hydrateRoom(serverRoom);
+      await subscribeToRoom(normalizedCode, 'Guest');
+      await claimSeat(serverRoom);
       setStatus('Joined synced room');
     },
-    [claimSeat, hydrateRoom, subscribeToRoom]
+    [claimSeat, fetchRoomFromServer, hydrateRoom, subscribeToRoom]
   );
 
-  const updateRoom = useCallback(async (updater: (current: RoomSnapshot) => RoomSnapshot) => {
-    setRoom((current) => {
+  const sendIntent = useCallback(
+    async (intent: SyncIntent, actorName = 'You') => {
+      const current = roomRef.current;
       if (!current) {
-        return current;
+        return;
       }
 
-      const next = updater(current);
-      saveActiveRoom(next);
-      void persistRoom(next);
-      return next;
-    });
-
-    setRecentRooms(loadRecentRooms());
-  }, []);
-
-  const newGameWithSettings = useCallback(
-  async (settingsInput: Partial<RoomSettings>) => {
-    await updateRoom((current) => {
-      const settings = buildRoomSettings({
-        ...current.settings,
-        ...settingsInput
-      });
-
-      const players = Array.from({ length: settings.playerCount }, (_, seatIndex) => {
-        const existing = current.players[seatIndex];
-        const commanderSlots = existing?.commanderNames.length ?? 1;
-
-        return {
-          id: existing?.id ?? newId(),
-          seatIndex,
-          playerName: existing?.playerName ?? `Player ${seatIndex + 1}`,
-          userLabel: existing?.userLabel,
-          color: existing?.color ?? seatColors[seatIndex % seatColors.length],
-          life: settings.startingLife,
-          poison: 0,
-          commanderNames:
-            existing?.commanderNames && existing.commanderNames.length > 0
-              ? [...existing.commanderNames]
-              : [`Commander ${seatIndex + 1}`],
-          commanderTax: Array.from({ length: commanderSlots }, () => 0),
-          commanderDamageTaken: {},
-          avatarUrl: existing?.avatarUrl ?? '',
-          backgroundUrl: existing?.backgroundUrl ?? '',
-          controllerClientId: current.syncMode === 'online' ? existing?.controllerClientId : undefined
-        };
-      });
-
-      return {
-        ...current,
-        format: settings.format,
-        startingLife: settings.startingLife,
-        settings,
-        players,
-        actionLog: [],
-        undoStack: [],
-        turnSeatIndex: 0,
-        updatedAt: new Date().toISOString()
+      const envelope: SyncIntentEnvelope = {
+        id: newId(),
+        clientId: clientId.current,
+        actorName,
+        sentAt: new Date().toISOString(),
+        intent
       };
-    });
 
-    setStatus('New game ready');
-  },
-  [updateRoom]
-);
+      if (current.syncMode === 'local') {
+        const next = normalizeRoomSnapshot(
+          bumpRoomRevision({
+            ...applyIntentToRoom(current, envelope),
+            updatedAt: new Date().toISOString()
+          })
+        );
+
+        if (!next) {
+          return;
+        }
+
+        hydrateRoom(next);
+        await persistRoom(next);
+        return;
+      }
+
+      if (isCurrentClientHost(current)) {
+        await applyIntentAsHost(envelope);
+        return;
+      }
+
+      if (!syncChannelRef.current) {
+        setStatus('Sync channel unavailable, attempting resync…');
+        await forceResyncCheck();
+        return;
+      }
+
+      const payload: SyncBroadcastPayload = {
+        type: 'intent',
+        roomCode: current.roomCode,
+        payload: envelope
+      };
+
+      await syncChannelRef.current.send({
+        type: 'broadcast',
+        event: 'intent',
+        payload
+      });
+
+      setStatus('Sent to host…');
+    },
+    [applyIntentAsHost, forceResyncCheck, hydrateRoom, isCurrentClientHost]
+  );
 
   const adjustLife = useCallback(
-  async (seatId: string, amount: number, actor = 'You') => {
-    await updateRoom((current) =>
-      withChange(
-        current,
-        actor,
-        `${current.players.find((player) => player.id === seatId)?.playerName ?? 'Player'} ${amount > 0 ? 'gains' : 'loses'} ${Math.abs(amount)} life`,
-        (players) =>
-          players.map((player) =>
-            player.id === seatId
-              ? {
-                  ...player,
-                  life: player.life + amount
-                }
-              : player
-          ),
-        {
-          reversible: true,
-          undo: {
-            kind: 'life',
-            seatId,
-            amount
-          }
-        }
-      )
-    );
-  },
-  [updateRoom]
-);
+    async (seatId: string, amount: number, actor = 'You') => {
+      await sendIntent({ kind: 'life', seatId, amount }, actor);
+    },
+    [sendIntent]
+  );
 
   const adjustPoison = useCallback(
-  async (seatId: string, amount: number, actor = 'You') => {
-    await updateRoom((current) =>
-      withChange(
-        current,
-        actor,
-        `Poison counter ${amount > 0 ? 'added to' : 'removed from'} ${current.players.find((player) => player.id === seatId)?.playerName ?? 'player'}`,
-        (players) =>
-          players.map((player) =>
-            player.id === seatId
-              ? {
-                  ...player,
-                  poison: Math.max(0, player.poison + amount)
-                }
-              : player
-          ),
-        {
-          reversible: true,
-          undo: {
-            kind: 'poison',
-            seatId,
-            amount
-          }
-        }
-      )
-    );
-  },
-  [updateRoom]
-);
+    async (seatId: string, amount: number, actor = 'You') => {
+      await sendIntent({ kind: 'poison', seatId, amount }, actor);
+    },
+    [sendIntent]
+  );
 
   const adjustCommanderTax = useCallback(
-  async (seatId: string, commanderIndex: number, amount: number, actor = 'You') => {
-    await updateRoom((current) =>
-      withChange(
-        current,
-        actor,
-        `Commander tax updated for ${current.players.find((player) => player.id === seatId)?.playerName ?? 'player'}`,
-        (players) =>
-          players.map((player) => {
-            if (player.id !== seatId) {
-              return player;
-            }
-
-            const commanderTax = [...player.commanderTax];
-            commanderTax[commanderIndex] = Math.max(0, (commanderTax[commanderIndex] ?? 0) + amount);
-
-            return {
-              ...player,
-              commanderTax
-            };
-          }),
-        {
-          reversible: true,
-          undo: {
-            kind: 'commander_tax',
-            seatId,
-            commanderIndex,
-            amount
-          }
-        }
-      )
-    );
-  },
-  [updateRoom]
-);
+    async (seatId: string, commanderIndex: number, amount: number, actor = 'You') => {
+      await sendIntent({ kind: 'commander_tax', seatId, commanderIndex, amount }, actor);
+    },
+    [sendIntent]
+  );
 
   const adjustCommanderDamage = useCallback(
-  async (targetSeatId: string, sourceCommanderKey: string, amount: number, actor = 'You') => {
-    await updateRoom((current) =>
-      withChange(
-        current,
-        actor,
-        `Commander damage updated on ${current.players.find((player) => player.id === targetSeatId)?.playerName ?? 'player'}`,
-        (players) =>
-          players.map((player) => {
-            if (player.id !== targetSeatId) {
-              return player;
-            }
-
-            const nextDamage = Math.max(0, (player.commanderDamageTaken[sourceCommanderKey] ?? 0) + amount);
-
-            return {
-              ...player,
-              commanderDamageTaken: {
-                ...player.commanderDamageTaken,
-                [sourceCommanderKey]: nextDamage
-              }
-            };
-          }),
-        {
-          reversible: true,
-          undo: {
-            kind: 'commander_damage',
-            targetSeatId,
-            sourceCommanderKey,
-            amount
-          }
-        }
-      )
-    );
-  },
-  [updateRoom]
-);
+    async (targetSeatId: string, sourceCommanderKey: string, amount: number, actor = 'You') => {
+      await sendIntent(
+        { kind: 'commander_damage', targetSeatId, sourceCommanderKey, amount },
+        actor
+      );
+    },
+    [sendIntent]
+  );
 
   const renamePlayer = useCallback(
     async (seatId: string, playerName: string) => {
-      await updateRoom((current) => ({
-        ...current,
-        players: current.players.map((player) => (player.id === seatId ? { ...player, playerName } : player)),
-        updatedAt: new Date().toISOString()
-      }));
+      await sendIntent({ kind: 'rename_player', seatId, playerName }, 'You');
     },
-    [updateRoom]
-  );
-
-  const setCommanderName = useCallback(
-    async (seatId: string, commanderIndex: number, name: string) => {
-      await updateRoom((current) => ({
-        ...current,
-        players: current.players.map((player) => {
-          if (player.id !== seatId) {
-            return player;
-          }
-
-          const commanderNames = [...player.commanderNames];
-          commanderNames[commanderIndex] = name;
-
-          return {
-            ...player,
-            commanderNames
-          };
-        }),
-        updatedAt: new Date().toISOString()
-      }));
-    },
-    [updateRoom]
-  );
-
-  const setPlayerMedia = useCallback(
-    async (seatId: string, patch: Pick<PlayerSeat, 'avatarUrl' | 'backgroundUrl'>) => {
-      await updateRoom((current) => ({
-        ...current,
-        players: current.players.map((player) => (player.id === seatId ? { ...player, ...patch } : player)),
-        updatedAt: new Date().toISOString()
-      }));
-    },
-    [updateRoom]
+    [sendIntent]
   );
 
   const setTurnSeatIndex = useCallback(
     async (seatIndex: number) => {
-      await updateRoom((current) => ({
-        ...current,
-        turnSeatIndex: seatIndex,
-        actionLog: [stampAction('System', `${current.players[seatIndex]?.playerName ?? 'Player'} has the turn`), ...current.actionLog].slice(0, 40),
-        undoStack: [pushUndo(current), ...current.undoStack].slice(0, 12),
-        updatedAt: new Date().toISOString()
-      }));
+      await sendIntent({ kind: 'set_turn', seatIndex }, 'System');
     },
-    [updateRoom]
+    [sendIntent]
   );
 
-  const undo = useCallback(async () => {
-    await updateRoom((current) => {
-      const [last, ...rest] = current.undoStack;
-      if (!last) {
-        return current;
-      }
-
-      return {
-        ...current,
-        players: clonePlayers(last.players),
-        actionLog: [stampAction('System', 'Undo applied'), ...last.actionLog].slice(0, 40),
-        turnSeatIndex: last.turnSeatIndex,
-        undoStack: rest,
-        updatedAt: new Date().toISOString()
-      };
-    });
-  }, [updateRoom]);
-
   const resetGame = useCallback(async () => {
-    await updateRoom((current) => ({
-      ...current,
-      players: current.players.map((player) => ({
-        ...player,
-        life: current.settings.startingLife,
-        poison: 0,
-        commanderTax: player.commanderTax.map(() => 0),
-        commanderDamageTaken: {}
-      })),
-      actionLog: [],
-      undoStack: [],
-      turnSeatIndex: 0,
-      updatedAt: new Date().toISOString()
-    }));
-
+    await sendIntent({ kind: 'reset_game' }, 'System');
     setStatus('Game reset');
-  }, [updateRoom]);
+  }, [sendIntent]);
 
-  const newGameSamePlayers = useCallback(async () => {
-    await updateRoom((current) => ({
-      ...current,
-      players: current.players.map((player) => ({
-        ...player,
-        life: current.startingLife,
-        poison: 0,
-        commanderTax: player.commanderTax.map(() => 0),
-        commanderDamageTaken: {}
-      })),
-      actionLog: [stampAction('System', 'New game started with same pod')],
-      undoStack: [],
-      turnSeatIndex: 0,
-      updatedAt: new Date().toISOString()
-    }));
-  }, [updateRoom]);
+  const newGameWithSettings = useCallback(
+    async (settings: Partial<RoomSettings>) => {
+      await sendIntent({ kind: 'new_game_with_settings', settings }, 'System');
+      setStatus('New game ready');
+    },
+    [sendIntent]
+  );
 
   const revertLogAction = useCallback(
-  async (actionId: string) => {
-    await updateRoom((current) => {
-      const action = current.actionLog.find((entry) => entry.id === actionId);
-
-      if (!action || !action.reversible || !action.undo) {
-        return current;
-      }
-
-      const undo = action.undo;
-      const nextPlayers = clonePlayers(current.players);
-
-      switch (undo.kind) {
-        case 'life': {
-          const player = nextPlayers.find((entry) => entry.id === undo.seatId);
-          if (player) {
-            player.life -= undo.amount;
-          }
-          break;
-        }
-
-        case 'poison': {
-          const player = nextPlayers.find((entry) => entry.id === undo.seatId);
-          if (player) {
-            player.poison = Math.max(0, player.poison - undo.amount);
-          }
-          break;
-        }
-
-        case 'commander_tax': {
-          const player = nextPlayers.find((entry) => entry.id === undo.seatId);
-          if (player) {
-            const nextTax = [...player.commanderTax];
-            nextTax[undo.commanderIndex] = Math.max(
-              0,
-              (nextTax[undo.commanderIndex] ?? 0) - undo.amount
-            );
-            player.commanderTax = nextTax;
-          }
-          break;
-        }
-
-        case 'commander_damage': {
-          const player = nextPlayers.find((entry) => entry.id === undo.targetSeatId);
-          if (player) {
-            const currentValue = player.commanderDamageTaken[undo.sourceCommanderKey] ?? 0;
-            player.commanderDamageTaken = {
-              ...player.commanderDamageTaken,
-              [undo.sourceCommanderKey]: Math.max(0, currentValue - undo.amount)
-            };
-          }
-          break;
-        }
-
-        default:
-          return current;
-      }
-
-      return {
-        ...current,
-        players: nextPlayers,
-        actionLog: current.actionLog.filter((entry) => entry.id !== actionId),
-        updatedAt: new Date().toISOString()
-      };
-    });
-  },
-  [updateRoom]
-);
+    async (actionId: string) => {
+      await sendIntent({ kind: 'revert_log_action', actionId }, 'System');
+    },
+    [sendIntent]
+  );
 
   const leaveRoom = useCallback(() => {
-    const activeRoom = room;
+    const activeRoom = roomRef.current;
 
     if (activeRoom?.syncMode === 'online') {
-      const releasedRoom: RoomSnapshot = {
-        ...activeRoom,
-        players: activeRoom.players.map((player) =>
-          player.controllerClientId === clientId.current
-            ? { ...player, controllerClientId: undefined }
-            : player
-        ),
-        updatedAt: new Date().toISOString()
-      };
+      const releasedRoom = normalizeRoomSnapshot(
+        bumpRoomRevision({
+          ...activeRoom,
+          hostClientId:
+            activeRoom.hostClientId === clientId.current ? undefined : activeRoom.hostClientId,
+          players: activeRoom.players.map((player) =>
+            player.controllerClientId === clientId.current
+              ? { ...player, controllerClientId: undefined }
+              : player
+          ),
+          updatedAt: new Date().toISOString()
+        })
+      );
 
-      void persistRoom(releasedRoom);
+      if (releasedRoom) {
+        void persistRoom(releasedRoom);
+      }
+
       clearSeatAssignment(activeRoom.roomCode);
-      clearRoomRole(activeRoom.roomCode);
     }
 
     roomSubRef.current?.unsubscribe?.();
     presenceChannelRef.current?.unsubscribe?.();
+    syncChannelRef.current?.unsubscribe?.();
+
     roomSubRef.current = null;
     presenceChannelRef.current = null;
+    syncChannelRef.current = null;
+
+    stopHeartbeatTimer();
+    stopResyncTimer();
 
     clearActiveRoom();
+    roomRef.current = null;
     setRoom(null);
     setConnectedClients({});
     setJoinCode('');
     setFocusedSeatId(null);
     setStatus('Back in lobby');
-    setClientRoomRole('player');
-  }, [room]);
+  }, [stopHeartbeatTimer, stopResyncTimer]);
 
   useEffect(() => {
     if (!room || room.syncMode !== 'online') {
       return;
     }
 
-    const controlledSeat = room.players.find((player) => player.controllerClientId === clientId.current);
+    const controlledSeat = room.players.find(
+      (player) => player.controllerClientId === clientId.current
+    );
+
     if (controlledSeat) {
       if (focusedSeatId !== controlledSeat.id) {
         setFocusedSeatId(controlledSeat.id);
@@ -828,24 +894,94 @@ export function useRoomState() {
       return;
     }
 
-    const controlledSeat = room.players.find((player) => player.controllerClientId === clientId.current);
+    const controlledSeat =
+      room.players.find((player) => player.controllerClientId === clientId.current) ??
+      room.players.find((player) => player.id === focusedSeatId);
 
     void presenceChannelRef.current.track({
-      name: controlledSeat?.playerName ?? (clientRoomRole === 'host' ? 'Host Display' : 'Guest'),
+      clientId: clientId.current,
+      name: controlledSeat?.playerName ?? 'Guest',
       seatId: controlledSeat?.id,
-      role: clientRoomRole,
       joinedAt: new Date().toISOString()
     });
   }, [focusedSeatId, room]);
 
   useEffect(() => {
+    if (!room || room.syncMode !== 'online') {
+      stopResyncTimer();
+      return;
+    }
+
+    stopResyncTimer();
+    resyncTimerRef.current = window.setInterval(() => {
+      void forceResyncCheck();
+    }, RESYNC_MS);
+
+    void forceResyncCheck();
+
+    return () => {
+      stopResyncTimer();
+    };
+  }, [forceResyncCheck, room?.roomCode, room?.syncMode, stopResyncTimer]);
+
+  useEffect(() => {
+    if (!room || room.syncMode !== 'online' || room.hostClientId !== clientId.current) {
+      stopHeartbeatTimer();
+      return;
+    }
+
+    stopHeartbeatTimer();
+    void sendHostHeartbeat();
+
+    heartbeatTimerRef.current = window.setInterval(() => {
+      void sendHostHeartbeat();
+    }, HEARTBEAT_MS);
+
+    return () => {
+      stopHeartbeatTimer();
+    };
+  }, [
+    room?.hostClientId,
+    room?.roomCode,
+    room?.syncMode,
+    sendHostHeartbeat,
+    stopHeartbeatTimer
+  ]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void forceResyncCheck();
+      }
+    };
+
+    const onOnline = () => {
+      void forceResyncCheck();
+    };
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('online', onOnline);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [forceResyncCheck]);
+
+  useEffect(() => {
     return () => {
       roomSubRef.current?.unsubscribe?.();
       presenceChannelRef.current?.unsubscribe?.();
+      syncChannelRef.current?.unsubscribe?.();
+      stopHeartbeatTimer();
+      stopResyncTimer();
     };
-  }, []);
+  }, [stopHeartbeatTimer, stopResyncTimer]);
 
-  const connectedCount = useMemo(() => Object.keys(connectedClients).length, [connectedClients]);
+  const connectedCount = useMemo(
+    () => Object.keys(connectedClients).length,
+    [connectedClients]
+  );
 
   return {
     room,
@@ -858,8 +994,6 @@ export function useRoomState() {
     adjustCommanderTax,
     adjustCommanderDamage,
     renamePlayer,
-    setCommanderName,
-    setPlayerMedia,
     resetGame,
     newGameWithSettings,
     revertLogAction,
@@ -871,7 +1005,6 @@ export function useRoomState() {
     hasSupabase,
     setTurnSeatIndex,
     leaveRoom,
-    focusedSeatId,
-    clientRoomRole
+    focusedSeatId
   };
 }

@@ -1,6 +1,7 @@
 import type { RoomSettings, RoomSnapshot } from '../types';
 import { newId } from '../lib/id';
 import { buildRoomSettings } from '../lib/roomSettings';
+import { refreshRoomChecksum } from '../lib/sync';
 
 const palette = ['#a855f7', '#38bdf8', '#f59e0b', '#ef4444', '#22c55e', '#ec4899', '#eab308', '#6366f1'];
 
@@ -44,6 +45,10 @@ export function createMockRoom(settingsInput: Partial<RoomSettings> = {}): RoomS
       commanderDamageTaken: {},
       avatarUrl: '',
       backgroundUrl: ''
-    }))
+    })),
+    hostClientId: undefined,
+    revision: 1,
+    checksum: '',
+    lastHeartbeatAt: now
   };
 }
