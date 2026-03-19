@@ -1,4 +1,4 @@
-# ManaBoard starter
+# ManaDork
 
 A mobile-first MTG life tracker designed for Commander pods, with local mode now and Supabase-backed realtime sync when environment variables are configured.
 
