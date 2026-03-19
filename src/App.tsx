@@ -24,8 +24,7 @@ function App() {
     hasSupabase,
     setTurnSeatIndex,
     leaveRoom,
-    focusedSeatId,
-    clientRoomRole
+    focusedSeatId
   } = useRoomState();
 
   return (
@@ -35,8 +34,8 @@ function App() {
           joinCode={joinCode}
           setJoinCode={setJoinCode}
           createLocalRoom={(settings) => createRoom('local', settings)}
-          createOnlineRoom={(settings, hostOnlyMode) =>
-            createRoom('online', settings, hostOnlyMode ? 'host' : 'player')
+          createOnlineRoom={(settings) =>
+            createRoom('online', settings)
           }
           joinRoom={() => joinRoom(joinCode)}
           joinRoomByCode={(roomCode) => joinRoom(roomCode)}
@@ -50,7 +49,6 @@ function App() {
           connectedCount={connectedCount}
           isOnline={isOnline}
           focusedSeatId={focusedSeatId}
-          clientRoomRole={clientRoomRole}
           onAdjustLife={adjustLife}
           onAdjustPoison={adjustPoison}
           onAdjustTax={adjustCommanderTax}

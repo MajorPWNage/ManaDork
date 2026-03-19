@@ -1,19 +1,51 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { buildRoomSettings, getDefaultStartingLife } from '../lib/roomSettings';
+import { buildRoomSettings } from '../lib/roomSettings';
 import type { RoomSettings } from '../types';
 
 interface RoomLobbyProps {
   joinCode: string;
   setJoinCode: (value: string) => void;
   createLocalRoom: (settings: Partial<RoomSettings>) => void;
-  createOnlineRoom: (settings: Partial<RoomSettings>, hostOnlyMode: boolean) => void;
+  createOnlineRoom: (settings: Partial<RoomSettings>) => void;
   joinRoom: () => void;
-  joinRoomByCode?: (roomCode: string) => void;
+  joinRoomByCode: (roomCode: string) => void;
   recentRooms: string[];
   hasSupabase: boolean;
 }
 
 const playerCounts = [2, 3, 4, 5, 6, 7, 8];
+
+function SectionBadge({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-zinc-300">
+      {children}
+    </span>
+  );
+}
+
+function SettingPillButton({
+  active,
+  onClick,
+  children
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-2xl px-3 py-3 text-sm font-bold transition ${
+        active
+          ? 'bg-white text-zinc-950 shadow-[0_0_20px_rgba(255,255,255,0.12)]'
+          : 'border border-white/10 bg-white/5 text-white hover:bg-white/10'
+      }`}
+      type="button"
+    >
+      {children}
+    </button>
+  );
+}
 
 export function RoomLobby({
   joinCode,
@@ -25,9 +57,14 @@ export function RoomLobby({
   recentRooms,
   hasSupabase
 }: RoomLobbyProps) {
+  // ---------------------------------------------------------------------------
+  // Room setup state
+  // Central place for the new-room options you expose on the lobby screen.
+  // This is a good place to add future toggles like game type, variants,
+  // extra counters, planechase, monarch, etc.
+  // ---------------------------------------------------------------------------
   const [settings, setSettings] = useState<RoomSettings>(() => buildRoomSettings());
-  const [hostOnlyMode, setHostOnlyMode] = useState(false);
-  const hasAttemptedAutoJoin = useRef(false);
+  const autoJoinedRef = useRef(false);
 
   const canCreate = useMemo(
     () => settings.playerCount >= 2 && settings.startingLife > 0,
@@ -38,8 +75,14 @@ export function RoomLobby({
     setSettings((current) => buildRoomSettings({ ...current, ...patch }));
   };
 
+  // ---------------------------------------------------------------------------
+  // Invite-link auto join
+  // Reads ?room=ABCD12 from the URL so shared links and QR codes can drop
+  // people directly into a room.
+  // autoJoinedRef prevents duplicate joins in React StrictMode/dev.
+  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (hasAttemptedAutoJoin.current) {
+    if (autoJoinedRef.current) {
       return;
     }
 
@@ -50,69 +93,77 @@ export function RoomLobby({
       return;
     }
 
-    hasAttemptedAutoJoin.current = true;
+    autoJoinedRef.current = true;
     setJoinCode(roomFromUrl);
+    joinRoomByCode(roomFromUrl);
 
-    if (joinRoomByCode) {
-      joinRoomByCode(roomFromUrl);
-      window.history.replaceState({}, '', window.location.pathname);
-    }
+    // Optional cleanup so refreshes do not keep retriggering the auto-join.
+    window.history.replaceState({}, '', window.location.pathname);
   }, [joinRoomByCode, setJoinCode]);
 
   return (
     <main className="mx-auto flex min-h-screen max-w-6xl items-center px-4 py-8 text-white">
       <div className="grid w-full gap-6 lg:grid-cols-[1.15fr,0.85fr]">
-        <section className="rounded-[32px] border border-white/10 bg-black/30 p-6 shadow-glow backdrop-blur">
-          <div className="mb-6 inline-flex items-center rounded-full border border-fuchsia-400/25 bg-fuchsia-500/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.22em] text-fuchsia-200">
-            Commander-first • mobile-first • realtime-ready
+        {/* -------------------------------------------------------------------
+            Left column: hero + room creation
+            This is the main “showpiece” section and the easiest area to
+            personalize with branding, flavor text, feature callouts, etc.
+           ------------------------------------------------------------------- */}
+        <section className="rounded-[32px] border border-cyan-400/10 bg-[linear-gradient(180deg,rgba(8,25,34,0.96),rgba(8,12,20,0.96))] p-6 shadow-[0_0_40px_rgba(0,150,200,0.08)] backdrop-blur">
+          <div className="mb-6 flex flex-wrap items-center gap-2">
+            <SectionBadge>ManaDork</SectionBadge>
+            <SectionBadge>Mobile-first</SectionBadge>
+            <SectionBadge>Realtime-ready</SectionBadge>
           </div>
 
           <h1 className="max-w-2xl text-4xl font-black tracking-tight text-white sm:text-5xl">
-            ManaDork keeps the life totals loud and the friction quiet.
+            Track the whole table without fighting the screen.
           </h1>
 
           <p className="mt-4 max-w-2xl text-base leading-7 text-zinc-300 sm:text-lg">
-            Start a local pod in one tap, or spin up a synced room so every phone stays locked to the same board state.
-            Life totals stay huge, commander stats stay close, and the interface stays thumb-friendly.
+            Build a pod, launch a synced room, and keep life totals front and center.
+            ManaDork is tuned for fast in-person play, giant readable numbers, and
+            smooth phone use around a real Commander table.
           </p>
 
-          <div className="mt-8 rounded-[28px] border border-white/10 bg-zinc-950/70 p-5">
-            <div className="mb-5 flex items-center justify-between gap-3">
+          {/* -----------------------------------------------------------------
+              Room settings panel
+              Add future room options here. This panel is intentionally built as
+              a reusable control cluster rather than a one-off card.
+             ----------------------------------------------------------------- */}
+          <div className="mt-8 rounded-[28px] border border-white/10 bg-black/25 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+            <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
               <div>
                 <h2 className="text-lg font-bold text-white">Room settings</h2>
                 <p className="mt-1 text-sm text-zinc-400">
-                  Build the pod first. More game types and add-ons can plug in later.
+                  Set the pod size and starting life now. This layout is ready for
+                  future format and rules options.
                 </p>
               </div>
 
-              <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-zinc-300">
-                Ready for expansion
-              </div>
+              <SectionBadge>Expandable</SectionBadge>
             </div>
 
             <div className="grid gap-5 md:grid-cols-2">
+              {/* Player count */}
               <div>
                 <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500">
                   Player count
                 </div>
                 <div className="grid grid-cols-4 gap-2">
                   {playerCounts.map((count) => (
-                    <button
+                    <SettingPillButton
                       key={count}
+                      active={settings.playerCount === count}
                       onClick={() => updateSettings({ playerCount: count })}
-                      className={`rounded-2xl px-3 py-3 text-sm font-bold transition ${
-                        settings.playerCount === count
-                          ? 'bg-white text-zinc-950'
-                          : 'border border-white/10 bg-white/5 text-white'
-                      }`}
-                      type="button"
                     >
                       {count}
-                    </button>
+                    </SettingPillButton>
                   ))}
                 </div>
               </div>
 
+              {/* Starting life */}
               <div>
                 <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500">
                   Starting life
@@ -124,129 +175,113 @@ export function RoomLobby({
                   value={settings.startingLife}
                   onChange={(event) =>
                     updateSettings({
-                      startingLife: Number(event.target.value || getDefaultStartingLife(settings.format))
+                      startingLife: Number(event.target.value || 40)
                     })
                   }
-                  className="w-full rounded-2xl border border-white/10 bg-zinc-950/80 px-4 py-3 text-lg font-semibold text-white outline-none placeholder:text-zinc-600"
+                  className="w-full rounded-2xl border border-white/10 bg-zinc-950/80 px-4 py-3 text-lg font-semibold text-white outline-none transition placeholder:text-zinc-600 focus:border-cyan-300/30 focus:bg-zinc-950"
                 />
                 <div className="mt-2 text-xs text-zinc-500">
-                  Commander defaults to 40, but you can set any custom value for house rules or variants.
+                  Commander default is 40, but house rules and other formats can use
+                  whatever you need.
                 </div>
               </div>
             </div>
 
-            <div className="mt-5 rounded-2xl border border-white/10 bg-black/30 p-4">
+            {/* Future hooks */}
+            <div className="mt-5 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
               <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-zinc-500">
                 Future settings hooks
               </div>
               <div className="flex flex-wrap gap-2">
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-zinc-300">
-                  Game type
-                </span>
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-zinc-300">
-                  Add-ons
-                </span>
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-zinc-300">
-                  Variant rules
-                </span>
-                <span className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold text-zinc-300">
-                  Extra counters
-                </span>
+                <SectionBadge>Game type</SectionBadge>
+                <SectionBadge>Variant rules</SectionBadge>
+                <SectionBadge>Add-ons</SectionBadge>
+                <SectionBadge>Extra counters</SectionBadge>
               </div>
             </div>
           </div>
 
+          {/* -----------------------------------------------------------------
+              Room creation buttons
+              Good place to personalize button styling, labels, or add feature
+              marketing text later.
+             ----------------------------------------------------------------- */}
           <div className="mt-6 grid gap-3 sm:grid-cols-2">
             <button
               onClick={() => createLocalRoom(settings)}
               disabled={!canCreate}
-              className="rounded-3xl border border-white/10 bg-white px-5 py-5 text-left text-zinc-950 shadow-glow transition hover:translate-y-[-1px] disabled:cursor-not-allowed disabled:opacity-50"
+              className="rounded-3xl border border-white/10 bg-white px-5 py-5 text-left text-zinc-950 shadow-[0_0_30px_rgba(255,255,255,0.08)] transition hover:translate-y-[-1px] disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
             >
-              <div className="text-sm font-semibold uppercase tracking-[0.18em]">Local only</div>
-              <div className="mt-2 text-2xl font-black">Create {settings.playerCount}-player pod</div>
+              <div className="text-sm font-semibold uppercase tracking-[0.18em]">Local play</div>
+              <div className="mt-2 text-2xl font-black">
+                Create {settings.playerCount}-player game
+              </div>
               <div className="mt-2 text-sm text-zinc-700">
-                {settings.startingLife} starting life on a single device.
+                {settings.startingLife} starting life on one device.
               </div>
             </button>
 
-            <div className="rounded-3xl border border-cyan-400/25 bg-cyan-500/10 px-5 py-5 text-white shadow-glow">
-              <div className="text-sm font-semibold uppercase tracking-[0.18em] text-cyan-200">Online sync</div>
-              <div className="mt-2 text-2xl font-black">
-                {hostOnlyMode ? 'Create host display room' : 'Create synced room'}
+            <button
+              onClick={() => createOnlineRoom(settings)}
+              disabled={!hasSupabase || !canCreate}
+              className="rounded-3xl border border-cyan-400/25 bg-cyan-500/10 px-5 py-5 text-left text-white shadow-[0_0_30px_rgba(0,200,255,0.08)] transition hover:translate-y-[-1px] disabled:cursor-not-allowed disabled:opacity-50"
+              type="button"
+            >
+              <div className="text-sm font-semibold uppercase tracking-[0.18em] text-cyan-200">
+                Online sync
               </div>
+              <div className="mt-2 text-2xl font-black">Create synced room</div>
               <div className="mt-2 text-sm text-cyan-100/80">
                 {hasSupabase
-                  ? hostOnlyMode
-                    ? 'This device becomes the host or judge display and does not claim a player seat.'
-                    : `${settings.playerCount} players, ${settings.startingLife} life, live across devices.`
+                  ? `${settings.playerCount} players, ${settings.startingLife} life, live across devices.`
                   : 'Add Supabase env vars to enable sync.'}
               </div>
-
-              <div className="mt-4 rounded-2xl border border-white/10 bg-black/30 p-4">
-                <label className="flex items-center justify-between gap-3">
-                  <div>
-                    <div className="text-sm font-semibold text-white">Host only mode</div>
-                    <div className="mt-1 text-xs text-zinc-400">
-                      Show the full board on this device without using a player slot.
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={() => setHostOnlyMode((value) => !value)}
-                    className={`relative h-7 w-12 shrink-0 rounded-full transition ${
-                      hostOnlyMode ? 'bg-cyan-400' : 'bg-white/10'
-                    }`}
-                    type="button"
-                    aria-pressed={hostOnlyMode}
-                  >
-                    <span
-                      className={`absolute top-1 h-5 w-5 rounded-full bg-white transition ${
-                        hostOnlyMode ? 'left-6' : 'left-1'
-                      }`}
-                    />
-                  </button>
-                </label>
-              </div>
-
-              <button
-                onClick={() => createOnlineRoom(settings, hostOnlyMode)}
-                disabled={!hasSupabase || !canCreate}
-                className="mt-4 w-full rounded-2xl bg-white px-4 py-4 text-sm font-bold uppercase tracking-[0.16em] text-zinc-950 disabled:cursor-not-allowed disabled:opacity-50"
-                type="button"
-              >
-                {hostOnlyMode ? 'Create host room' : 'Create synced room'}
-              </button>
-            </div>
+            </button>
           </div>
         </section>
 
-        <section className="rounded-[32px] border border-white/10 bg-black/30 p-6 shadow-glow backdrop-blur">
+        {/* -------------------------------------------------------------------
+            Right column: join room + recent rooms
+            This is the easiest spot to add branding art, release notes, patch
+            notes, or "how to join" tips later.
+           ------------------------------------------------------------------- */}
+        <section className="rounded-[32px] border border-white/10 bg-[linear-gradient(180deg,rgba(16,16,20,0.9),rgba(10,10,14,0.92))] p-6 shadow-[0_0_40px_rgba(0,0,0,0.2)] backdrop-blur">
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <SectionBadge>Quick join</SectionBadge>
+            <SectionBadge>Share links</SectionBadge>
+            <SectionBadge>Recent rooms</SectionBadge>
+          </div>
+
           <h2 className="text-xl font-bold text-white">Join a room</h2>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            Paste a room code or pick a recent room. Great for kitchen-table pods and remote chaos alike.
+            Paste a room code or tap a recent room. Invite links and QR codes can
+            also bring players straight here.
           </p>
 
+          {/* Join form */}
           <div className="mt-5 flex gap-3">
             <input
               value={joinCode}
               onChange={(event) => setJoinCode(event.target.value.toUpperCase())}
               placeholder="ROOM CODE"
-              className="flex-1 rounded-2xl border border-white/10 bg-zinc-950/80 px-4 py-4 text-lg font-semibold tracking-[0.28em] text-white outline-none ring-0 placeholder:text-zinc-600"
+              className="flex-1 rounded-2xl border border-white/10 bg-zinc-950/80 px-4 py-4 text-lg font-semibold tracking-[0.28em] text-white outline-none transition placeholder:text-zinc-600 focus:border-cyan-300/30 focus:bg-zinc-950"
             />
             <button
               onClick={joinRoom}
-              className="rounded-2xl border border-white/10 bg-white px-5 py-4 text-sm font-bold uppercase tracking-[0.16em] text-zinc-950"
+              className="rounded-2xl border border-white/10 bg-white px-5 py-4 text-sm font-bold uppercase tracking-[0.16em] text-zinc-950 transition hover:translate-y-[-1px]"
               type="button"
             >
               Join
             </button>
           </div>
 
-          <div className="mt-6">
+          {/* Recent rooms */}
+          <div className="mt-6 rounded-2xl border border-white/10 bg-white/[0.03] p-4">
             <div className="mb-3 text-xs font-semibold uppercase tracking-[0.22em] text-zinc-500">
               Recent rooms
             </div>
+
             <div className="flex flex-wrap gap-2">
               {recentRooms.length === 0 ? (
                 <span className="text-sm text-zinc-500">No saved rooms yet.</span>
@@ -255,7 +290,7 @@ export function RoomLobby({
                   <button
                     key={roomCode}
                     onClick={() => setJoinCode(roomCode)}
-                    className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-zinc-200"
+                    className="rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm font-semibold text-zinc-200 transition hover:bg-white/10"
                     type="button"
                   >
                     {roomCode}
@@ -263,6 +298,15 @@ export function RoomLobby({
                 ))
               )}
             </div>
+          </div>
+
+          {/* Optional polish / messaging block */}
+          <div className="mt-6 rounded-2xl border border-dashed border-white/10 bg-black/20 p-4">
+            <div className="text-sm font-semibold text-white">Showcase-ready tip</div>
+            <p className="mt-2 text-sm leading-6 text-zinc-400">
+              This panel is a nice place for your logo, changelog notes, custom flavor
+              text, or a short “how it works” explanation before you show it off.
+            </p>
           </div>
         </section>
       </div>

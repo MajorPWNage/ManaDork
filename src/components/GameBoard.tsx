@@ -13,7 +13,6 @@ interface GameBoardProps {
   connectedCount: number;
   isOnline: boolean;
   focusedSeatId: string | null;
-  clientRoomRole: 'player' | 'host';
   onAdjustLife: (seatId: string, amount: number) => void;
   onAdjustPoison: (seatId: string, amount: number) => void;
   onAdjustTax: (seatId: string, commanderIndex: number, amount: number) => void;
@@ -381,7 +380,6 @@ export function GameBoard({
   connectedCount,
   isOnline,
   focusedSeatId,
-  clientRoomRole,
   onAdjustLife,
   onAdjustPoison,
   onAdjustTax,
@@ -398,6 +396,7 @@ export function GameBoard({
   const [dockExpanded, setDockExpanded] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [hostViewEnabled, setHostViewEnabled] = useState(false);
 
   const effectiveSettings =
     room.settings ??
@@ -408,12 +407,22 @@ export function GameBoard({
     });
 
   const focusedPlayer = useMemo(() => {
-    if (!isOnline || clientRoomRole === 'host' || !focusedSeatId) {
+    if (!isOnline || !focusedSeatId) {
       return null;
     }
 
     return room.players.find((player) => player.id === focusedSeatId) ?? null;
-  }, [clientRoomRole, focusedSeatId, isOnline, room.players]);
+  }, [focusedSeatId, isOnline, room.players]);
+
+  const isHostClient = useMemo(() => {
+    return Boolean(
+      isOnline &&
+        focusedPlayer &&
+        focusedPlayer.controllerClientId &&
+        room.hostClientId &&
+        focusedPlayer.controllerClientId === room.hostClientId
+    );
+  }, [focusedPlayer, isOnline, room.hostClientId]);
 
   const opponents = useMemo(() => {
     if (!focusedPlayer) {
@@ -428,7 +437,18 @@ export function GameBoard({
     [opponents, selectedOpponentId]
   );
 
-  const showFullBoard = !isOnline || clientRoomRole === 'host';
+  const showFullBoard = !isOnline || (isHostClient && hostViewEnabled);
+
+  useEffect(() => {
+    if (!isOnline) {
+      setHostViewEnabled(false);
+      return;
+    }
+
+    if (!isHostClient) {
+      setHostViewEnabled(false);
+    }
+  }, [isHostClient, isOnline, room.roomCode]);
 
   useEffect(() => {
     const previousOverflow = document.body.style.overflow;
@@ -489,6 +509,17 @@ export function GameBoard({
         </div>
 
         <div className="grid grid-cols-2 gap-2">
+          {isOnline && isHostClient ? (
+            <ControlButton
+              onClick={() => {
+                setHostViewEnabled((value) => !value);
+                setMenuOpen(false);
+              }}
+            >
+              {hostViewEnabled ? 'Player View' : 'Host View'}
+            </ControlButton>
+          ) : null}
+
           <ControlButton
             onClick={() => {
               setInviteOpen(true);
@@ -533,7 +564,8 @@ export function GameBoard({
             <Badge>{room.format}</Badge>
             <Badge>Room {room.roomCode}</Badge>
             <Badge>{isOnline ? `${connectedCount} connected` : 'Local mode'}</Badge>
-            {isOnline && clientRoomRole === 'host' ? <Badge>Host View</Badge> : null}
+            {isOnline && isHostClient ? <Badge>Host</Badge> : null}
+            {isOnline && isHostClient && hostViewEnabled ? <Badge>Host View</Badge> : null}
           </div>
           <p className="text-sm text-zinc-300">{status}</p>
         </div>
@@ -581,7 +613,8 @@ export function GameBoard({
                 <Badge>{room.format}</Badge>
                 <Badge>Room {room.roomCode}</Badge>
                 <Badge>{isOnline ? `${connectedCount} connected` : 'Local mode'}</Badge>
-                {isOnline && clientRoomRole === 'host' ? <Badge>Host View</Badge> : null}
+                {isOnline && isHostClient ? <Badge>Host</Badge> : null}
+                {isOnline && isHostClient && hostViewEnabled ? <Badge>Host View</Badge> : null}
               </div>
               <div className="mt-2 text-xs text-zinc-400 sm:text-sm">{status}</div>
             </div>
@@ -597,6 +630,12 @@ export function GameBoard({
           </div>
 
           <div className="mt-3 hidden flex-wrap gap-2 xl:flex">
+            {isOnline && isHostClient ? (
+              <ControlButton onClick={() => setHostViewEnabled((value) => !value)}>
+                {hostViewEnabled ? 'Player View' : 'Host View'}
+              </ControlButton>
+            ) : null}
+
             <ControlButton onClick={() => setInviteOpen(true)}>Invite</ControlButton>
             <ControlButton onClick={onReset}>Reset</ControlButton>
             <ControlButton onClick={() => setSettingsOpen(true)} primary>
@@ -702,6 +741,12 @@ export function GameBoard({
           </button>
 
           <div className="hidden gap-2 xl:flex">
+            {isOnline && isHostClient ? (
+              <ControlButton onClick={() => setHostViewEnabled((value) => !value)}>
+                {hostViewEnabled ? 'Player View' : 'Host View'}
+              </ControlButton>
+            ) : null}
+
             <ControlButton onClick={() => setInviteOpen(true)}>Invite</ControlButton>
             <ControlButton onClick={onReset}>Reset</ControlButton>
             <ControlButton onClick={() => setSettingsOpen(true)} primary>
